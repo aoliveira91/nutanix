@@ -434,9 +434,9 @@ def main():
     # ========================================================================
     # CONFIGURATION - Update these values for your environment
     # ========================================================================
-    PC_IP = "10.38.176.7"           # Prism Central IP address
+    PC_IP = "10.10.10.10"           # Prism Central IP address - UPDATE THIS!
     USERNAME = "admin"               # PC username
-    PASSWORD = "nx2Tech527!"       # PC password - UPDATE THIS!
+    PASSWORD = "PC-PW"       # PC password - UPDATE THIS!
     
     # Validate configuration
     if PASSWORD == "your-password":
