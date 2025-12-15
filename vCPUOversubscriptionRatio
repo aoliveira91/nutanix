@@ -1,0 +1,468 @@
+#!/usr/bin/env python3
+"""
+Nutanix Prism Central CPU Oversubscription Calculator
+Uses v3 APIs (compatible with all Prism Central versions)
+
+This script calculates CPU oversubscription ratios by:
+1. Connecting to Prism Central
+2. Discovering all AOS/AHV clusters
+3. Counting physical CPU cores from hosts
+4. Counting virtual CPUs from VMs
+5. Calculating oversubscription ratio (vCPUs / pCPUs)
+6. Exporting results to JSON and CSV
+"""
+
+import requests
+import json
+import base64
+import sys
+from typing import Dict, List, Optional
+from urllib3.exceptions import InsecureRequestWarning
+
+# Suppress SSL warnings (remove in production with proper certs)
+requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
+
+
+class NutanixV3Client:
+    """Client for Nutanix Prism Central v3 APIs"""
+    
+    def __init__(self, pc_ip: str, username: str, password: str, verify_ssl: bool = False):
+        """
+        Initialize Nutanix API client
+        
+        Args:
+            pc_ip: Prism Central IP address
+            username: PC username
+            password: PC password
+            verify_ssl: Whether to verify SSL certificates (default: False for self-signed)
+        """
+        self.base_url = f"https://{pc_ip}:9440/api/nutanix/v3"
+        self.verify_ssl = verify_ssl
+        self.session = requests.Session()
+        
+        # Set up basic authentication header
+        # Format: "Basic <base64 encoded username:password>"
+        credentials = f"{username}:{password}"
+        encoded = base64.b64encode(credentials.encode()).decode()
+        self.session.headers.update({
+            "Authorization": f"Basic {encoded}",
+            "Content-Type": "application/json",
+            "Accept": "application/json"
+        })
+    
+    def _make_request(self, method: str, endpoint: str, data: Optional[Dict] = None) -> Dict:
+        """
+        Make API request with error handling
+        
+        Args:
+            method: HTTP method (GET or POST)
+            endpoint: API endpoint path (e.g., "/clusters/list")
+            data: Request payload for POST requests
+            
+        Returns:
+            JSON response as dictionary
+            
+        Raises:
+            requests.exceptions.RequestException: If API call fails
+        """
+        url = f"{self.base_url}{endpoint}"
+        
+        try:
+            if method.upper() == "GET":
+                response = self.session.get(url, verify=self.verify_ssl)
+            elif method.upper() == "POST":
+                response = self.session.post(url, json=data, verify=self.verify_ssl)
+            else:
+                raise ValueError(f"Unsupported method: {method}")
+            
+            # Raise exception for HTTP errors (4xx, 5xx)
+            response.raise_for_status()
+            return response.json()
+        
+        except requests.exceptions.RequestException as e:
+            print(f"API request failed: {e}")
+            if hasattr(e, 'response') and e.response is not None:
+                print(f"Response: {e.response.text}")
+            raise
+    
+    def list_clusters(self) -> List[Dict]:
+        """
+        List all AOS/AHV clusters managed by Prism Central
+        
+        Returns:
+            List of cluster dictionaries containing metadata and status
+            
+        Note:
+            - Filters out Prism Central itself (which appears as a "cluster")
+            - Only returns clusters with AOS service (these run AHV hypervisor)
+        """
+        # Prepare payload for cluster list API
+        payload = {
+            "kind": "cluster",
+            "length": 500  # Max results to return (adjust if you have 500+ clusters)
+        }
+        
+        # Call the v3 clusters/list endpoint
+        result = self._make_request("POST", "/clusters/list", payload)
+        clusters = result.get("entities", [])
+        
+        print(f"DEBUG: Found {len(clusters)} total cluster(s)")
+        
+        # Filter for AOS/AHV clusters only
+        ahv_clusters = []
+        for cluster in clusters:
+            # Extract cluster name from status section
+            cluster_name = cluster.get("status", {}).get("name", "Unknown")
+            
+            # Navigate to resources section where service_list is located
+            resources = cluster.get("status", {}).get("resources", {})
+            config = resources.get("config", {})
+            service_list = config.get("service_list", [])
+            
+            print(f"DEBUG: Cluster '{cluster_name}' has services: {service_list}")
+            
+            # Determine if this is an AOS cluster (not Prism Central)
+            # - Prism Central shows up with service "PRISM_CENTRAL"
+            # - AOS clusters show up with service "AOS" and run AHV hypervisor
+            is_pc = "PRISM_CENTRAL" in service_list
+            is_aos_cluster = "AOS" in service_list
+            
+            if is_aos_cluster and not is_pc:
+                ahv_clusters.append(cluster)
+                print(f"DEBUG: ✓ Cluster '{cluster_name}' identified as AOS/AHV cluster")
+            else:
+                reason = "is Prism Central" if is_pc else "no AOS service"
+                print(f"DEBUG: ✗ Cluster '{cluster_name}' excluded ({reason})")
+        
+        return ahv_clusters
+    
+    def list_hosts(self, cluster_uuid: str) -> List[Dict]:
+        """
+        List all hosts (physical servers) in a specific cluster
+        
+        Args:
+            cluster_uuid: UUID of the cluster to query
+            
+        Returns:
+            List of host dictionaries containing hardware details
+        """
+        # Prepare payload with filter for specific cluster
+        payload = {
+            "kind": "host",
+            "length": 500,  # Max results to return
+            "filter": f"cluster_reference=={cluster_uuid}"  # Filter syntax for v3 API
+        }
+        
+        try:
+            result = self._make_request("POST", "/hosts/list", payload)
+            return result.get("entities", [])
+        except Exception as e:
+            print(f"Warning: Failed to list hosts for cluster {cluster_uuid}: {e}")
+            return []
+    
+    def list_vms(self, cluster_uuid: str) -> List[Dict]:
+        """
+        List all VMs in a specific cluster
+        
+        Args:
+            cluster_uuid: UUID of the cluster to query
+            
+        Returns:
+            List of VM dictionaries containing configuration details
+        """
+        # Prepare payload with filter for specific cluster
+        payload = {
+            "kind": "vm",
+            "length": 500,  # Max results to return
+            #"filter": f"cluster_reference=={cluster_uuid}"  # Filter syntax for v3 API
+        }
+        
+        try:
+            result = self._make_request("POST", "/vms/list", payload)
+            return result.get("entities", [])
+        except Exception as e:
+            print(f"Warning: Failed to list VMs for cluster {cluster_uuid}: {e}")
+            return []
+    
+    def get_host_cpu_count(self, host: Dict) -> int:
+        """
+        Extract physical CPU core count from host object
+        
+        Args:
+            host: Host dictionary from API response
+            
+        Returns:
+            Number of physical CPU cores in the host
+            
+        Note:
+            Falls back to estimating from CPU capacity if core count unavailable
+        """
+        resources = host.get("status", {}).get("resources", {})
+        
+        # Try to get number of CPU cores directly
+        cpu_count = resources.get("num_cpu_cores", 0)
+        
+        # Fallback: estimate from total CPU capacity if core count not available
+        # Assumes ~2.5 GHz per core (rough average for modern CPUs)
+        if cpu_count == 0:
+            cpu_capacity = resources.get("cpu_capacity_in_hz", 0)
+            if cpu_capacity > 0:
+                cpu_count = int(cpu_capacity / 2500000000)  # 2.5 GHz in Hz
+        
+        return int(cpu_count)
+    
+    def get_vm_vcpu_count(self, vm: Dict) -> int:
+        """
+        Extract virtual CPU count from VM object
+        
+        Args:
+            vm: VM dictionary from API response
+            
+        Returns:
+            Total number of vCPUs assigned to the VM
+            
+        Note:
+            Total vCPUs = num_sockets × num_vcpus_per_socket
+        """
+        resources = vm.get("status", {}).get("resources", {})
+        
+        # Get vCPU configuration
+        # VMs have sockets (virtual CPU packages) and VCPUs per socket (cores per package)
+        num_sockets = resources.get("num_sockets", 0)
+        num_vcpus_per_socket = resources.get("num_vcpus_per_socket", 1)
+        
+        # Calculate total vCPUs
+        vcpu_count = num_sockets * num_vcpus_per_socket
+        
+        return int(vcpu_count)
+
+
+class OversubscriptionCalculator:
+    """Calculate CPU oversubscription ratios for Nutanix clusters"""
+    
+    def __init__(self, client: NutanixV3Client):
+        """
+        Initialize calculator with API client
+        
+        Args:
+            client: Configured NutanixV3Client instance
+        """
+        self.client = client
+        self.cluster_stats = []  # Store per-cluster statistics
+    
+    def calculate(self) -> Dict:
+        """
+        Calculate CPU oversubscription for all clusters
+        
+        Returns:
+            Dictionary containing per-cluster stats and global summary
+            
+        Process:
+            1. Get all AOS/AHV clusters
+            2. For each cluster:
+               - Count physical CPUs from hosts
+               - Count virtual CPUs from VMs
+               - Calculate ratio (vCPUs / pCPUs)
+            3. Calculate global totals across all clusters
+        """
+        print("Fetching cluster list...")
+        clusters = self.client.list_clusters()
+        
+        # Handle case where no clusters are found
+        if not clusters:
+            print("No AHV clusters found!")
+            return {"clusters": [], "global": {}}
+        
+        print(f"Found {len(clusters)} AHV cluster(s)\n")
+        
+        # Initialize global counters
+        total_pcpus = 0
+        total_vcpus = 0
+        
+        # Process each cluster
+        for cluster in clusters:
+            # Extract cluster identifiers
+            cluster_uuid = cluster.get("metadata", {}).get("uuid")
+            cluster_name = cluster.get("status", {}).get("name", "Unknown")
+            
+            print(f"Processing cluster: {cluster_name} ({cluster_uuid})")
+            
+            # Step 1: Get all hosts and count physical CPUs
+            hosts = self.client.list_hosts(cluster_uuid)
+            pcpus = sum(self.client.get_host_cpu_count(h) for h in hosts)
+            print(f"  Hosts: {len(hosts)}, Total pCPUs: {pcpus}")
+            
+            # Step 2: Get all VMs and count virtual CPUs
+            vms = self.client.list_vms(cluster_uuid)
+            vcpus = sum(self.client.get_vm_vcpu_count(v) for v in vms)
+            print(f"  VMs: {len(vms)}, Total vCPUs: {vcpus}")
+            
+            # Step 3: Calculate oversubscription ratio
+            # Ratio = Total vCPUs / Total pCPUs
+            # Handle divide-by-zero if cluster has no hosts
+            ratio = vcpus / pcpus if pcpus > 0 else 0
+            
+            # Store cluster statistics
+            cluster_stat = {
+                "cluster_name": cluster_name,
+                "cluster_uuid": cluster_uuid,
+                "hosts": len(hosts),
+                "total_pcpus": pcpus,
+                "vms": len(vms),
+                "total_vcpus": vcpus,
+                "oversubscription_ratio": round(ratio, 2)  # Round to 2 decimal places
+            }
+            
+            self.cluster_stats.append(cluster_stat)
+            print(f"  Oversubscription Ratio: {ratio:.2f}:1\n")
+            
+            # Accumulate global totals
+            total_pcpus += pcpus
+            total_vcpus += vcpus
+        
+        # Calculate global oversubscription ratio across all clusters
+        global_ratio = total_vcpus / total_pcpus if total_pcpus > 0 else 0
+        
+        # Return complete results
+        result = {
+            "clusters": self.cluster_stats,
+            "global": {
+                "total_clusters": len(clusters),
+                "total_pcpus": total_pcpus,
+                "total_vcpus": total_vcpus,
+                "global_oversubscription_ratio": round(global_ratio, 2)
+            }
+        }
+        
+        return result
+    
+    def print_summary(self, results: Dict):
+        """
+        Print formatted summary of results to console
+        
+        Args:
+            results: Results dictionary from calculate() method
+        """
+        print("\n" + "="*70)
+        print("CPU OVERSUBSCRIPTION SUMMARY")
+        print("="*70)
+        
+        # Handle empty results
+        if not results["clusters"]:
+            print("\nNo clusters to report.")
+            print("="*70 + "\n")
+            return
+        
+        # Print per-cluster details
+        for cluster in results["clusters"]:
+            print(f"\nCluster: {cluster['cluster_name']}")
+            print(f"  UUID: {cluster['cluster_uuid']}")
+            print(f"  Hosts: {cluster['hosts']}")
+            print(f"  Physical CPUs: {cluster['total_pcpus']}")
+            print(f"  VMs: {cluster['vms']}")
+            print(f"  Virtual CPUs: {cluster['total_vcpus']}")
+            print(f"  Oversubscription: {cluster['oversubscription_ratio']}:1")
+        
+        # Print global summary
+        print("\n" + "-"*70)
+        print("GLOBAL SUMMARY")
+        print("-"*70)
+        global_stats = results.get("global", {})
+        print(f"Total Clusters: {global_stats.get('total_clusters', 0)}")
+        print(f"Total Physical CPUs: {global_stats.get('total_pcpus', 0)}")
+        print(f"Total Virtual CPUs: {global_stats.get('total_vcpus', 0)}")
+        print(f"Global Oversubscription: {global_stats.get('global_oversubscription_ratio', 0)}:1")
+        print("="*70 + "\n")
+    
+    def export_json(self, results: Dict, filename: str = "oversubscription_report.json"):
+        """
+        Export results to JSON file
+        
+        Args:
+            results: Results dictionary from calculate() method
+            filename: Output filename (default: oversubscription_report.json)
+        """
+        with open(filename, 'w') as f:
+            json.dump(results, f, indent=2)
+        print(f"Results exported to {filename}")
+    
+    def export_csv(self, results: Dict, filename: str = "oversubscription_report.csv"):
+        """
+        Export results to CSV file for spreadsheet analysis
+        
+        Args:
+            results: Results dictionary from calculate() method
+            filename: Output filename (default: oversubscription_report.csv)
+        """
+        import csv
+        
+        with open(filename, 'w', newline='') as f:
+            writer = csv.writer(f)
+            
+            # Write header row
+            writer.writerow([
+                "Cluster Name", "Cluster UUID", "Hosts", 
+                "Physical CPUs", "VMs", "Virtual CPUs", 
+                "Oversubscription Ratio"
+            ])
+            
+            # Write data rows (one per cluster)
+            for cluster in results["clusters"]:
+                writer.writerow([
+                    cluster['cluster_name'],
+                    cluster['cluster_uuid'],
+                    cluster['hosts'],
+                    cluster['total_pcpus'],
+                    cluster['vms'],
+                    cluster['total_vcpus'],
+                    f"{cluster['oversubscription_ratio']}:1"
+                ])
+        
+        print(f"Results exported to {filename}")
+
+
+def main():
+    """
+    Main execution function
+    
+    Workflow:
+        1. Connect to Prism Central
+        2. Calculate CPU oversubscription ratios
+        3. Display results to console
+        4. Export to JSON and CSV files
+    """
+    # ========================================================================
+    # CONFIGURATION - Update these values for your environment
+    # ========================================================================
+    PC_IP = "10.38.176.7"           # Prism Central IP address
+    USERNAME = "admin"               # PC username
+    PASSWORD = "nx2Tech527!"       # PC password - UPDATE THIS!
+    
+    # Validate configuration
+    if PASSWORD == "your-password":
+        print("ERROR: Please update PASSWORD in the script")
+        sys.exit(1)
+    
+    try:
+        # Step 1: Initialize API client and authenticate
+        print(f"Connecting to Prism Central at {PC_IP}...")
+        client = NutanixV3Client(PC_IP, USERNAME, PASSWORD)
+        
+        # Step 2: Calculate oversubscription ratios
+        calculator = OversubscriptionCalculator(client)
+        results = calculator.calculate()
+        
+        # Step 3: Print formatted summary to console
+        calculator.print_summary(results)
+        
+        # Step 4: Export results to files
+        calculator.export_json(results)   # Machine-readable JSON
+        calculator.export_csv(results)    # Human-readable CSV for Excel
+        
+    except Exception as e:
+        print(f"\nERROR: {e}")
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
