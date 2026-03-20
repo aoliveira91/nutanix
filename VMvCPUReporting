@@ -1,0 +1,454 @@
+#!/usr/bin/env python3
+"""
+Nutanix VM Inventory - Prism Central v4 API (falls back to v3)
+Pulls raw vCPU/core/socket layout for all VMs across all clusters.
+Output: Excel (.xlsx) with per-VM compute details.
+"""
+
+import requests
+import urllib3
+import sys
+import getpass
+from datetime import datetime
+from openpyxl import Workbook
+from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+from openpyxl.utils import get_column_letter
+
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+# ── Config ────────────────────────────────────────────────────────────────────
+
+PAGE_SIZE = 50   # v4 default page size (max 100)
+
+# ── Auth & Session ────────────────────────────────────────────────────────────
+
+def get_session(pc_ip, username, password):
+    session = requests.Session()
+    session.auth = (username, password)
+    session.verify = False
+    return session
+
+# ── API Version Detection ─────────────────────────────────────────────────────
+
+def detect_api_version(session, pc_ip):
+    """Try v4 first, fall back to v3."""
+    v4_url = f"https://{pc_ip}:9440/api/vmm/v4.0/ahv/config/vms?$limit=1"
+    session.headers.update({"Content-Type": "application/json"})
+    try:
+        resp = session.get(v4_url)
+        if resp.status_code in (200, 206):
+            print("  API version: v4 ✓")
+            return "v4"
+        else:
+            print(f"  v4 returned {resp.status_code}, trying v3...")
+    except Exception:
+        print("  v4 unreachable, trying v3...")
+
+    v3_url = f"https://{pc_ip}:9440/api/nutanix/v3/vms/list"
+    try:
+        resp = session.post(v3_url, json={"kind": "vm", "length": 1})
+        if resp.status_code == 200:
+            print("  API version: v3 ✓")
+            return "v3"
+    except Exception:
+        pass
+
+    return None
+
+# ── v4 VM Fetch ───────────────────────────────────────────────────────────────
+
+def fetch_all_vms_v4(session, pc_ip):
+    """Page through v4 vmm API."""
+    vms = []
+    page = 0
+
+    # v4 uses $page and $limit query params
+    base_url = f"https://{pc_ip}:9440/api/vmm/v4.0/ahv/config/vms"
+
+    while True:
+        url = f"{base_url}?$limit={PAGE_SIZE}&$page={page}"
+        resp = session.get(url)
+        resp.raise_for_status()
+        data = resp.json()
+
+        entities = data.get("data", [])
+        if not entities:
+            break
+
+        vms.extend(entities)
+
+        # v4 pagination metadata
+        meta = data.get("metadata", {})
+        total = meta.get("totalAvailableResults", len(vms))
+        fetched = len(vms)
+
+        print(f"  Fetched {fetched} / {total} VMs...", end="\r")
+
+        if fetched >= total:
+            break
+
+        page += 1
+
+    print(f"\n  Done — {len(vms)} VMs retrieved.")
+    return vms
+
+def extract_vm_row_v4(vm):
+    """Pull fields from a v4 VM entity.
+
+    v4 API schema (matches Prism UI labels):
+      numSockets        = "CPUs" in UI  (what users think of as vCPUs)
+      numCoresPerSocket = "Cores Per CPU" in UI
+      numThreadsPerCore = threads (almost always 1)
+
+    Total vCPUs = numSockets
+    Total Cores = numSockets * numCoresPerSocket
+    """
+    name         = vm.get("name", "")
+    vm_uuid      = vm.get("extId", "")
+    power_state  = vm.get("powerState", "")
+
+    cluster_ref  = vm.get("cluster", {}) or {}
+    cluster_name = cluster_ref.get("name", "") or cluster_ref.get("extId", "")
+
+    # v4: numSockets == vCPUs (Prism UI "CPUs" field)
+    # v4: numCoresPerSocket == Cores Per CPU (Prism UI "Cores Per CPU" field)
+    num_vcpus        = vm.get("numSockets", "")
+    cores_per_vcpu   = vm.get("numCoresPerSocket", "")
+    threads_per_core = vm.get("numThreadsPerCore", 1) or 1
+
+    try:
+        total_vcpus = int(num_vcpus)
+    except (TypeError, ValueError):
+        total_vcpus = ""
+
+    try:
+        total_cores = int(num_vcpus) * int(cores_per_vcpu)
+    except (TypeError, ValueError):
+        total_cores = ""
+
+    memory_bytes = vm.get("memorySizeBytes", 0)
+    try:
+        memory_mib_val = int(memory_bytes) // (1024 * 1024)
+        memory_gib     = round(memory_mib_val / 1024, 1)
+    except (TypeError, ValueError):
+        memory_mib_val = ""
+        memory_gib     = ""
+
+    host_ref  = vm.get("host", {}) or {}
+    host_name = host_ref.get("name", "") or host_ref.get("extId", "")
+    os_type   = vm.get("guestOsId", "") or ""
+
+    return {
+        "VM Name":          name,
+        "Cluster":          cluster_name,
+        "Host":             host_name,
+        "Power State":      power_state,
+        "vCPUs":            num_vcpus,
+        "Cores per vCPU":   cores_per_vcpu,
+        "Threads per Core": threads_per_core,
+        "Total vCPUs":      total_vcpus,
+        "Total Cores":      total_cores,
+        "Memory (GiB)":     memory_gib,
+        "Memory (MiB)":     memory_mib_val,
+        "Guest OS":         os_type,
+        "UUID":             vm_uuid,
+    }
+
+
+# ── v3 VM Fetch (fallback) ────────────────────────────────────────────────────
+
+def fetch_all_vms_v3(session, pc_ip):
+    url = f"https://{pc_ip}:9440/api/nutanix/v3/vms/list"
+    vms, offset = [], 0
+
+    while True:
+        resp = session.post(url, json={"kind": "vm", "offset": offset, "length": 500})
+        resp.raise_for_status()
+        data     = resp.json()
+        entities = data.get("entities", [])
+        vms.extend(entities)
+        total  = data.get("metadata", {}).get("total_matches", 0)
+        offset += len(entities)
+        print(f"  Fetched {offset} / {total} VMs...", end="\r")
+        if offset >= total or not entities:
+            break
+
+    print(f"\n  Done — {len(vms)} VMs retrieved.")
+    return vms
+
+def extract_vm_row_v3(vm):
+    """Pull the fields we care about from a v3 VM entity."""
+    meta       = vm.get("metadata", {})
+    spec       = vm.get("spec", {})
+    res        = spec.get("resources", {})
+    status     = vm.get("status", {})
+    status_res = status.get("resources", {})
+
+    name         = spec.get("name") or status.get("name", "")
+    cluster_ref  = spec.get("cluster_reference", {})
+    cluster_name = cluster_ref.get("name", "")
+
+    num_sockets          = res.get("num_sockets")          or status_res.get("num_sockets", "")
+    num_vcpus_per_socket = res.get("num_vcpus_per_socket") or status_res.get("num_vcpus_per_socket", "")
+    num_cores_per_vcpu   = res.get("num_cores_per_vcpu")   or status_res.get("num_cores_per_vcpu", "")
+    memory_size_mib      = res.get("memory_size_mib")      or status_res.get("memory_size_mib", "")
+
+    try:
+        total_vcpus = int(num_sockets) * int(num_vcpus_per_socket)
+    except (TypeError, ValueError):
+        total_vcpus = ""
+
+    try:
+        total_cores = int(total_vcpus) * int(num_cores_per_vcpu)
+    except (TypeError, ValueError):
+        total_cores = ""
+
+    try:
+        memory_gib = round(int(memory_size_mib) / 1024, 1)
+    except (TypeError, ValueError):
+        memory_gib = ""
+
+    power_state = status_res.get("power_state", "")
+    vm_uuid     = meta.get("uuid", "")
+    os_type     = res.get("guest_os_id") or ""
+    host_ref    = status_res.get("host_reference", {}) or {}
+    host_name   = host_ref.get("name", "")
+
+    return {
+        "VM Name":              name,
+        "Cluster":              cluster_name,
+        "Host":                 host_name,
+        "Power State":          power_state,
+        "Sockets":              num_sockets,
+        "vCPUs per Socket":     num_vcpus_per_socket,
+        "Cores per vCPU":       num_cores_per_vcpu,
+        "Total vCPUs":          total_vcpus,
+        "Total Cores":          total_cores,
+        "Memory (GiB)":         memory_gib,
+        "Memory (MiB)":         memory_size_mib,
+        "Guest OS":             os_type,
+        "UUID":                 vm_uuid,
+    }
+
+# ── Excel Output ──────────────────────────────────────────────────────────────
+
+# ── Nutanix Brand Colors ──────────────────────────────────────────────────────
+# Core: Iris Purple #7855fa, Charcoal Gray #131313, White #ffffff
+# Accent (totals row): Aqua Blue #1fdde9
+
+HEADER_FILL  = PatternFill("solid", start_color="7855fa")   # Iris Purple
+HEADER_FONT  = Font(bold=True, color="FFFFFF", name="Arial", size=10)
+ALT_FILL     = PatternFill("solid", start_color="F3F0FF")   # Light purple tint
+NORMAL_FILL  = PatternFill("solid", start_color="FFFFFF")   # White
+TOTAL_FILL   = PatternFill("solid", start_color="1fdde9")   # Aqua Blue accent
+DATA_FONT    = Font(name="Arial", size=10, color="131313")  # Charcoal Gray
+BOLD_FONT    = Font(name="Arial", size=10, bold=True, color="131313")
+TOTAL_FONT   = Font(name="Arial", size=10, bold=True, color="131313")
+CENTER       = Alignment(horizontal="center", vertical="center")
+LEFT         = Alignment(horizontal="left",   vertical="center")
+
+THIN_BORDER = Border(
+    left=Side(style="thin",   color="E0D9FF"),  # soft purple border
+    right=Side(style="thin",  color="E0D9FF"),
+    top=Side(style="thin",    color="E0D9FF"),
+    bottom=Side(style="thin", color="E0D9FF"),
+)
+
+# v4 rows use: vCPUs, Cores per vCPU, Threads per Core
+# v3 rows use: Sockets, vCPUs per Socket, Cores per vCPU
+# COLUMNS covers the superset; missing fields render as blank
+COLUMNS = [
+    ("VM Name",           30, LEFT),
+    ("Cluster",           20, LEFT),
+    ("Host",              20, LEFT),
+    ("Power State",       12, CENTER),
+    ("vCPUs",             10, CENTER),   # v4: numSockets (= vCPUs in UI)
+    ("Cores per vCPU",    15, CENTER),   # v4: numCoresPerSocket / v3: num_cores_per_vcpu
+    ("Threads per Core",  15, CENTER),   # v4: numThreadsPerCore (usually 1)
+    ("Sockets",           10, CENTER),   # v3 only
+    ("vCPUs per Socket",  16, CENTER),   # v3 only
+    ("Total vCPUs",       12, CENTER),
+    ("Total Cores",       12, CENTER),
+    ("Memory (GiB)",      13, CENTER),
+    ("Memory (MiB)",      13, CENTER),
+    ("Guest OS",          25, LEFT),
+    ("UUID",              38, LEFT),
+]
+
+def write_excel(rows, output_path):
+    wb = Workbook()
+
+    # ── VM Inventory sheet ────────────────────────────────────────────────────
+    ws = wb.active
+    ws.title = "VM Inventory"
+    ws.freeze_panes = "A2"
+
+    headers = [c[0] for c in COLUMNS]
+    ws.append(headers)
+
+    # Style header row
+    for col_idx, (col_name, width, align) in enumerate(COLUMNS, start=1):
+        cell = ws.cell(row=1, column=col_idx)
+        cell.font      = HEADER_FONT
+        cell.fill      = HEADER_FILL
+        cell.alignment = CENTER
+        cell.border    = THIN_BORDER
+        ws.column_dimensions[get_column_letter(col_idx)].width = width
+
+    ws.row_dimensions[1].height = 20
+
+    # Data rows
+    col_map = {name: i+1 for i, (name, _, _) in enumerate(COLUMNS)}
+
+    for row_idx, row in enumerate(rows, start=2):
+        fill = ALT_FILL if row_idx % 2 == 0 else NORMAL_FILL
+        for col_name, _, align in COLUMNS:
+            col_idx = col_map[col_name]
+            val  = row.get(col_name, "")
+            cell = ws.cell(row=row_idx, column=col_idx, value=val)
+            cell.font      = DATA_FONT
+            cell.fill      = fill
+            cell.alignment = align
+            cell.border    = THIN_BORDER
+
+
+
+    # Auto-filter
+    ws.auto_filter.ref = f"A1:{get_column_letter(len(COLUMNS))}1"
+
+    # ── Summary sheet ─────────────────────────────────────────────────────────
+    ws2 = wb.create_sheet("Summary")
+    ws2.freeze_panes = "A2"
+    ws2.column_dimensions["A"].width = 25
+    ws2.column_dimensions["B"].width = 15
+    ws2.column_dimensions["C"].width = 15
+    ws2.column_dimensions["D"].width = 15
+    ws2.column_dimensions["E"].width = 15
+
+    sum_headers = ["Cluster", "Total VMs", "Total vCPUs", "Total Cores", "Total Memory (GiB)"]
+    for col_idx, h in enumerate(sum_headers, start=1):
+        cell = ws2.cell(row=1, column=col_idx, value=h)
+        cell.font      = HEADER_FONT
+        cell.fill      = HEADER_FILL
+        cell.alignment = CENTER
+        cell.border    = THIN_BORDER
+
+    # Aggregate by cluster
+    clusters = {}
+    for row in rows:
+        c = row.get("Cluster") or "Unknown"
+        if c not in clusters:
+            clusters[c] = {"vms": 0, "vcpus": 0, "cores": 0, "mem": 0.0}
+        clusters[c]["vms"] += 1
+        try: clusters[c]["vcpus"] += int(row.get("Total vCPUs", 0) or 0)
+        except: pass
+        try: clusters[c]["cores"] += int(row.get("Total Cores", 0) or 0)
+        except: pass
+        try: clusters[c]["mem"] += float(row.get("Memory (GiB)", 0) or 0)
+        except: pass
+
+    for row_idx, (cluster, vals) in enumerate(sorted(clusters.items()), start=2):
+        fill = ALT_FILL if row_idx % 2 == 0 else NORMAL_FILL
+        for col_idx, val in enumerate([
+            cluster,
+            vals["vms"],
+            vals["vcpus"],
+            vals["cores"],
+            round(vals["mem"], 1)
+        ], start=1):
+            cell = ws2.cell(row=row_idx, column=col_idx, value=val)
+            cell.font      = DATA_FONT
+            cell.fill      = fill
+            cell.alignment = CENTER if col_idx > 1 else LEFT
+            cell.border    = THIN_BORDER
+
+    # Totals row
+    total_row = len(clusters) + 2
+    total_label = ws2.cell(row=total_row, column=1, value="TOTAL")
+    total_label.font = TOTAL_FONT
+    total_label.fill = TOTAL_FILL
+    total_label.alignment = LEFT
+    total_label.border = THIN_BORDER
+    for col_idx, formula in [
+        (2, f"=SUM(B2:B{total_row-1})"),
+        (3, f"=SUM(C2:C{total_row-1})"),
+        (4, f"=SUM(D2:D{total_row-1})"),
+        (5, f"=SUM(E2:E{total_row-1})"),
+    ]:
+        cell = ws2.cell(row=total_row, column=col_idx, value=formula)
+        cell.font      = TOTAL_FONT
+        cell.alignment = CENTER
+        cell.border    = THIN_BORDER
+        cell.fill      = TOTAL_FILL
+
+    ws2.auto_filter.ref = f"A1:E1"
+
+    # ── Notes sheet ───────────────────────────────────────────────────────────
+    ws3 = wb.create_sheet("Notes")
+    ws3.column_dimensions["A"].width = 80
+    notes = [
+        ("Nutanix VM Inventory — Notes", True),
+        ("", False),
+        (f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", False),
+        ("Source: Prism Central v3 API (/api/nutanix/v3/vms/list)", False),
+        ("", False),
+        ("Column Definitions:", True),
+        ("  Sockets          — num_sockets from API (physical CPU sockets assigned to VM)", False),
+        ("  vCPUs per Socket — num_vcpus_per_socket", False),
+        ("  Cores per vCPU   — num_cores_per_vcpu", False),
+        ("  Total vCPUs      — Sockets × vCPUs per Socket", False),
+        ("  Total Cores      — Total vCPUs × Cores per vCPU", False),
+        ("", False),
+        ("Known Reporting Issue:", True),
+        ("  A VM with 4 vCPUs and 4 Cores per vCPU will show as 16 'cores' in reports.", False),
+        ("  Use vCPUs and Cores per vCPU columns for accurate capacity planning.", False),
+        ("  Use the raw Sockets/vCPUs per Socket/Cores per vCPU columns for accurate capacity planning.", False),
+    ]
+    for row_idx, (text, bold) in enumerate(notes, start=1):
+        cell = ws3.cell(row=row_idx, column=1, value=text)
+        cell.font = Font(name="Arial", size=10, bold=bold)
+
+    wb.save(output_path)
+    print(f"  Saved: {output_path}")
+
+# ── Main ──────────────────────────────────────────────────────────────────────
+
+def main():
+    print("=== Nutanix VM Inventory (Prism Central) ===\n")
+
+    pc_ip    = input("Prism Central IP/FQDN: ").strip()
+    username = input("Username: ").strip()
+    password = getpass.getpass("Password: ")
+
+    timestamp   = datetime.now().strftime("%Y%m%d_%H%M%S")
+    output_path = f"NutanixVMInventory_{pc_ip}_{timestamp}.xlsx"
+
+    print(f"\nConnecting to {pc_ip}...")
+    session = get_session(pc_ip, username, password)
+
+    api_version = detect_api_version(session, pc_ip)
+    if not api_version:
+        print("\nCould not reach v3 or v4 API. Check IP, credentials, and network access to port 9440.")
+        sys.exit(1)
+
+    print("Fetching VMs...\n")
+    if api_version == "v4":
+        vms  = fetch_all_vms_v4(session, pc_ip)
+        rows = [extract_vm_row_v4(vm) for vm in vms]
+    else:
+        vms  = fetch_all_vms_v3(session, pc_ip)
+        rows = [extract_vm_row_v3(vm) for vm in vms]
+
+    print("\nProcessing...")
+
+    # Sort: cluster → VM name
+    rows.sort(key=lambda r: (r.get("Cluster", ""), r.get("VM Name", "")))
+
+    print("Writing Excel...")
+    write_excel(rows, output_path)
+
+    print(f"\nDone. Output: {output_path}")
+    print(f"  {len(rows)} VMs across {len(set(r['Cluster'] for r in rows))} clusters.")
+
+if __name__ == "__main__":
+    main()
