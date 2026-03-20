@@ -400,6 +400,7 @@ def write_excel(rows, output_path):
         ("  Total Cores      — Total vCPUs × Cores per vCPU", False),
         ("", False),
         ("Known Reporting Issue:", True),
+        ("  Prism UI surfaces 'Cores' as Total vCPUs × Cores per vCPU.", False),
         ("  A VM with 4 vCPUs and 4 Cores per vCPU will show as 16 'cores' in reports.", False),
         ("  Use vCPUs and Cores per vCPU columns for accurate capacity planning.", False),
         ("  Use the raw Sockets/vCPUs per Socket/Cores per vCPU columns for accurate capacity planning.", False),
